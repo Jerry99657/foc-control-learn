@@ -45,6 +45,8 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     mycode/open_loop.c
+    mycode/MT6701.c
+    mycode/close_loop.c
     # Add user sources here
 )
 

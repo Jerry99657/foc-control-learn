@@ -30,6 +30,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "open_loop.h"
+#include "close_loop.h"
+#include "MT6701.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -114,6 +116,11 @@ int main(void)
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+    // 2. 触发第一次 MT6701 的 SPI DMA 读取，建立后台循环更新
+  HAL_SPI_TransmitReceive_DMA(&hspi1, MT6701_Data, MT6701_Data, 3);
+  
+  // 3. 执行电机零点对齐标定 (注意电机在上电时会强制转动一下然后锁死3秒)
+  alignSensor();
 
   /* USER CODE END 2 */
 
@@ -122,7 +129,7 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-    velocityOpenloop(10.0f);
+    positionCloseLoop(0.0f);
 
     /* USER CODE BEGIN 3 */
   }
