@@ -1,5 +1,38 @@
 #include "JerryFOC.h"
 
+// ================= 算法实现：DWT 微秒级延时 =================
+static void delay_us(uint32_t us) {
+    uint32_t ticks = us * 170; // 170MHz 主频下 1us = 170 ticks
+    uint32_t start = DWT->CYCCNT;
+    while ((DWT->CYCCNT - start) < ticks);
+}
+
+// ================= 大疆无人机启动音效 =================
+void JerryFOC_playStartupSound(void) {
+    // 经典的音效: Do-Mi-So-Do (C5, E5, G5, C6)
+    uint16_t notes[] = {523, 659, 783, 1046}; 
+    uint16_t durations[] = {150, 150, 150, 300}; // 持续时间 ms
+    
+    for (int i = 0; i < 4; i++) {
+        uint32_t start_time = HAL_GetTick();
+        uint32_t period_us = 1000000 / notes[i];
+        uint32_t half_period_us = period_us / 2;
+        
+        while ((HAL_GetTick() - start_time) < durations[i]) {
+            // 在 Ud 轴注入高频交变电压 (Uq=0，不会产生转矩旋转)
+            JerryFOC_setPhaseVoltage(0.0f, 2.0f, 0.0f);
+            delay_us(half_period_us);
+            
+            JerryFOC_setPhaseVoltage(0.0f, -2.0f, 0.0f);
+            delay_us(half_period_us);
+        }
+        
+        // 音符之间稍作静音停顿
+        JerryFOC_setPhaseVoltage(0.0f, 0.0f, 0.0f);
+        HAL_Delay(20);
+    }
+}
+
 // ================= 参数与全局变量 =================
 static float voltage_power_supply = 12.0f; 
 static float zero_electric_angle = 0;

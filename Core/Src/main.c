@@ -142,6 +142,9 @@ int main(void)
 
   // 这里暂时不要开启 TIM2！否则会导致 alignSensor 期间速度计算发生瞬间飞车突变！
 
+  // 播放大疆启动音效 (滴-滴-滴-滴)
+  JerryFOC_playStartupSound();
+
   // 3. 执行电机零点对齐标定 (注意电机在上电时会强制转动一下然后锁死3秒)
   JerryFOC_alignSensor();
   // 设置目标速度 10

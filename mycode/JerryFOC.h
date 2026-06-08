@@ -34,6 +34,9 @@ extern LowPassFilter M0_Vel_Flt;
 extern PIDController vel_loop_M0;
 
 // ================= 接口函数声明 =================
+// 启动音效
+void JerryFOC_playStartupSound(void);
+
 // 基础 FOC 底层配置
 void JerryFOC_alignSensor(void);
 void JerryFOC_setPhaseVoltage(float Uq, float Ud, float angle_el);
