@@ -29,9 +29,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "open_loop.h"
-#include "close_loop.h"
+#include "JerryFOC.h"
 #include "MT6701.h"
+#include <stdlib.h> // for atof
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -63,7 +63,25 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+uint8_t rx_byte;
+char rx_buffer[32];
+uint8_t rx_index = 0;
 
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+    if(huart->Instance == USART1) {
+        if(rx_byte == '\n') {
+            rx_buffer[rx_index] = '\0';
+            float target = atof(rx_buffer);
+            JerryFOC_setVelocity(target); // 更新目标速度
+            rx_index = 0;
+        } else if (rx_byte != '\r') {
+            if(rx_index < 31) {
+                rx_buffer[rx_index++] = rx_byte;
+            }
+        }
+        HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
+    }
+}
 /* USER CODE END 0 */
 
 /**
@@ -119,8 +137,18 @@ int main(void)
     // 2. 触发第一次 MT6701 的 SPI DMA 读取，建立后台循环更新
   HAL_SPI_TransmitReceive_DMA(&hspi1, MT6701_Data, MT6701_Data, 3);
   
+  // 开启 USART1 串口中断接收，等待上位机下发速度指令
+  HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
+
+  // 这里暂时不要开启 TIM2！否则会导致 alignSensor 期间速度计算发生瞬间飞车突变！
+
   // 3. 执行电机零点对齐标定 (注意电机在上电时会强制转动一下然后锁死3秒)
-  alignSensor();
+  JerryFOC_alignSensor();
+  // 设置目标速度 10
+  JerryFOC_setVelocity(10.0f);  
+
+  // 开启 TIM2 定时器中断，等彻底标定好再开始执行闭环运算！
+  HAL_TIM_Base_Start_IT(&htim2);
 
   /* USER CODE END 2 */
 
@@ -129,9 +157,10 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-    positionCloseLoop(0.0f);
 
     /* USER CODE BEGIN 3 */
+    // 内环：极速 FOC 换相
+    JerryFOC_run();
   }
   /* USER CODE END 3 */
 }
@@ -148,7 +177,7 @@ void SystemClock_Config(void)
 
   /** Configure the main internal regulator output voltage
   */
-  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1);
+  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
@@ -159,8 +188,8 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.HSI48State = RCC_HSI48_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV1;
-  RCC_OscInitStruct.PLL.PLLN = 8;
+  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV4;
+  RCC_OscInitStruct.PLL.PLLN = 85;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
   RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
@@ -178,7 +207,7 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
   {
     Error_Handler();
   }

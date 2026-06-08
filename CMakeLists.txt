@@ -46,7 +46,7 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     mycode/open_loop.c
     mycode/MT6701.c
-    mycode/close_loop.c
+    mycode/JerryFOC.c
     # Add user sources here
 )
 
@@ -70,3 +70,6 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
 
     # Add user defined libraries
 )
+
+# Enable float support for printf and scanf
+target_link_options(${CMAKE_PROJECT_NAME} PRIVATE "-u_printf_float" "-u_scanf_float")
