@@ -33,17 +33,35 @@ typedef struct {
 extern LowPassFilter M0_Vel_Flt;
 extern PIDController vel_loop_M0;
 
+// 电流环全局对象
+extern LowPassFilter M0_Curr_Flt;
+extern PIDController curr_loop_M0;
+
+// ================= 控制模式枚举 =================
+typedef enum {
+    JERRYFOC_MODE_TORQUE = 0,    // 纯扭矩/电流模式 (只闭环 Iq)
+    JERRYFOC_MODE_VELOCITY = 1   // 速度模式 (速度外环 + Iq 内环)
+} JerryFOC_ControlMode;
+
 // ================= 接口函数声明 =================
 // 启动音效
 void JerryFOC_playStartupSound(void);
 
-// 基础 FOC 底层配置
+// 模式与目标设置
+void JerryFOC_setMode(JerryFOC_ControlMode mode);
+void JerryFOC_setVelocity(float target_vel);
+void JerryFOC_setCurrent(float target_Iq);
 void JerryFOC_alignSensor(void);
 void JerryFOC_setPhaseVoltage(float Uq, float Ud, float angle_el);
 
-// PID 与滤波计算函数 (将被 TIM2 1ms 中断调用)
+// PID 与滤波计算函数
 float JerryFOC_LPF_Calc(LowPassFilter* filter, float x);
 float JerryFOC_PID_Calc(PIDController* pid, float error);
+
+// Clarke 与 Park 变换
+void JerryFOC_Clarke(float Ia, float Ib, float* Ialpha, float* Ibeta);
+float JerryFOC_Park(float Ialpha, float Ibeta, float angle_el);
+
 
 // 速度控制高层接口
 void JerryFOC_setVelocity(float target_vel);
@@ -51,6 +69,9 @@ void JerryFOC_setVelocity(float target_vel);
 // 供外部获取状态
 float JerryFOC_getVelocity(void);
 float JerryFOC_getAngle(void);
+float JerryFOC_getPhaseCurrent_A(void);
+float JerryFOC_getPhaseCurrent_B(void);
+float JerryFOC_getIq(void);
 
 // 主循环高速调用接口
 void JerryFOC_run(void);

@@ -140,6 +140,10 @@ int main(void)
   // 开启 USART1 串口中断接收，等待上位机下发速度指令
   HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
 
+  // 开启 ADC 的注入组！这非常关键，这是硬件级电流采样的核心！
+  HAL_ADCEx_InjectedStart(&hadc1);
+  HAL_ADCEx_InjectedStart(&hadc2);
+
   // 这里暂时不要开启 TIM2！否则会导致 alignSensor 期间速度计算发生瞬间飞车突变！
 
   // 播放大疆启动音效 (滴-滴-滴-滴)
@@ -147,10 +151,12 @@ int main(void)
 
   // 3. 执行电机零点对齐标定 (注意电机在上电时会强制转动一下然后锁死3秒)
   JerryFOC_alignSensor();
-  // 设置目标速度 10
-  JerryFOC_setVelocity(10.0f);  
 
-  // 开启 TIM2 定时器中断，等彻底标定好再开始执行闭环运算！
+  // ===== 速度-电流双闭环模式 =====
+  JerryFOC_setMode(JERRYFOC_MODE_VELOCITY);
+  JerryFOC_setVelocity(20.0f);  // 目标速度 20 rad/s (约 3.2 圈/秒)
+
+  // 开启 TIM2 定时器中断
   HAL_TIM_Base_Start_IT(&htim2);
 
   /* USER CODE END 2 */
