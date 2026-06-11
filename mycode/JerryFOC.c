@@ -59,23 +59,40 @@ static float mechanical_zero_offset = 0;
 
 // 速度外环变量
 float filtered_velocity_global = 0.0f;
+float JerryFOC_Target_Position = 0.0f;
 float JerryFOC_Target_Velocity = 0.0f;
 float JerryFOC_Target_Iq = 0.0f; // 由速度环 PID 计算得出，供给内层电流 FOC
+float velocity_limit_global = 30.0f; // 默认速度限幅 30 rad/s
+
+// 电流环使能标志 (默认 0：电压控制模式)
+uint8_t flag_use_current_loop = 0;
+
+void JerryFOC_useCurrentLoop(uint8_t enable) {
+    flag_use_current_loop = enable;
+}
 
 // 电流内环变量
 float phase_current_a = 0.0f;
 float phase_current_b = 0.0f;
+float id_current = 0.0f;
 float iq_current = 0.0f;
 
 // 速度低通滤波器 (Tf=0.02s, 截止频率约 8Hz，充分平滑速度噪声)
 LowPassFilter M0_Vel_Flt = { .Tf = 0.02f, .y_prev = 0.0f }; 
-// 电流低通滤波器 (Tf=0.001s, 截止频率约 160Hz)
-LowPassFilter M0_Curr_Flt = { .Tf = 0.001f, .y_prev = 0.0f };
+// 电流低通滤波器 (Tf=0.0001s, 截止频率约 1600Hz，极小化相位延迟)
+LowPassFilter M0_Curr_Flt = { .Tf = 0.0001f, .y_prev = 0.0f };
 
-// 速度外环 PID (直接输出电压 Uq！限幅 2.0V 足够让云台电机达到最高速)
+// 位置外环 PID (纯P控制即可，P=2.0 比较柔和，限幅默认为 30.0 rad/s)
+PIDController pos_loop_M0 = { .P = 2.0f, .I = 0.0f, .D = 0.0f, .output_ramp = 0.0f, .limit = 30.0f, .error_prev = 0.0f, .output_prev = 0.0f, .integral_prev = 0.0f };
+
+// 速度内环 PID (直接输出电压 Uq！限幅 2.0V 足够让云台电机达到最高速)
 PIDController vel_loop_M0 = { .P = 0.05f, .I = 0.5f, .D = 0.0f, .output_ramp = 0.0f, .limit = 2.0f, .error_prev = 0.0f, .output_prev = 0.0f, .integral_prev = 0.0f };
-// 电流内环 PID (暂时弃用)
-PIDController curr_loop_M0 = { .P = 0.0f, .I = 0.0f, .D = 0.0f, .output_ramp = 100000.0f, .limit = 6.0f, .error_prev = 0.0f, .output_prev = 0.0f, .integral_prev = 0.0f };
+
+// 电流最内环 PID (带宽降低为 250rad/s，避免高频震荡)
+// P = Ls * 250 = 0.00086 * 250 = 0.215
+// I = Rs * 250 = 2.3 * 250 = 575
+PIDController id_loop_M0 = { .P = 0.215f, .I = 575.0f, .D = 0.0f, .output_ramp = 100000.0f, .limit = 12.0f, .error_prev = 0.0f, .output_prev = 0.0f, .integral_prev = 0.0f };
+PIDController iq_loop_M0 = { .P = 0.215f, .I = 575.0f, .D = 0.0f, .output_ramp = 100000.0f, .limit = 12.0f, .error_prev = 0.0f, .output_prev = 0.0f, .integral_prev = 0.0f };
 
 
 
@@ -161,7 +178,7 @@ void JerryFOC_alignSensor(void) {
     JerryFOC_setPhaseVoltage(3.0f, 0.0f, 3.0f * PI / 2.0f);
     HAL_Delay(3000); 
     
-    zero_electric_angle = (DIR * POLE_PAIRS) * Angle;
+    zero_electric_angle = _normalizeAngle((float)(DIR * POLE_PAIRS) * Angle);
     
     prev_Angle = Angle;
     full_rotations = 0;
@@ -191,6 +208,23 @@ float JerryFOC_getAngle() {
 
 // ================= 闭环：模式、速度、扭矩设定与获取 =================
 void JerryFOC_setMode(JerryFOC_ControlMode mode) { current_control_mode = mode; }
+void JerryFOC_setPosition(float target_pos, float limit) { 
+    // 获取当前的绝对机械角度
+    float current_abs_pos = JerryFOC_getAngle();
+    
+    // 算出当前所处的“整圈起点基准坐标” (即向下取整的 2PI 倍数)
+    // 例如当前 7.4pi (3.7圈)，除以 2pi = 3.7，floor(3.7) = 3，基准就是 6pi
+    float base_angle = floorf(current_abs_pos / (2.0f * PI)) * 2.0f * PI;
+    
+    // 将用户传入的“相对本圈”的坐标加上基准坐标，得出绝对目标位置
+    JerryFOC_Target_Position = base_angle + target_pos; 
+    
+    if (limit <= 0.0f) {
+        limit = 30.0f; // 默认最大限幅 30 rad/s
+    }
+    velocity_limit_global = limit; 
+    pos_loop_M0.limit = limit; 
+}
 void JerryFOC_setVelocity(float target_vel) { JerryFOC_Target_Velocity = target_vel; }
 void JerryFOC_setCurrent(float target_Iq) { JerryFOC_Target_Iq = target_Iq; }
 float JerryFOC_getVelocity(void) { return filtered_velocity_global; }
@@ -204,11 +238,11 @@ void JerryFOC_Clarke(float Ia, float Ib, float* Ialpha, float* Ibeta) {
     *Ibeta = (1.0f / sqrtf(3.0f)) * Ia + (2.0f / sqrtf(3.0f)) * Ib;
 }
 
-float JerryFOC_Park(float Ialpha, float Ibeta, float angle_el) {
+void JerryFOC_Park(float Ialpha, float Ibeta, float angle_el, float *Id, float *Iq) {
     float ct = cosf(angle_el);
     float st = sinf(angle_el);
-    // 这里采用 DengFOC 的 Iq 计算公式
-    return Ibeta * ct - Ialpha * st;
+    *Id = Ialpha * ct + Ibeta * st;
+    *Iq = Ibeta * ct - Ialpha * st;
 }
 
 // 主循环极速执行函数：只负责根据最新的 Uq 和电角度执行底层换相
@@ -216,8 +250,9 @@ void JerryFOC_run(void) {
     // 检查 ADC 注入组是否完成了一次新的转换 (由 TIM1 5kHz TRGO 自动触发)
     // 只有当新的 ADC 数据到来时，我们才执行一轮电流环，保证严格的 5kHz 同步
     if (ADC1->ISR & ADC_ISR_JEOS) {
-        // 清除标志位
+        // 清除标志位 (主机 ADC1 和 从机 ADC2 都要清，否则 ADC2 可能停滞)
         ADC1->ISR |= ADC_ISR_JEOS;
+        ADC2->ISR |= ADC_ISR_JEOS;
         
         // 1. 获取最新角度
         float electrical_angle = JerryFOC_getElectricalAngle();
@@ -233,32 +268,50 @@ void JerryFOC_run(void) {
         // 4. Clarke & Park
         float Ialpha, Ibeta;
         JerryFOC_Clarke(phase_current_a, phase_current_b, &Ialpha, &Ibeta);
-        float raw_Iq = JerryFOC_Park(Ialpha, Ibeta, electrical_angle);
+        float raw_Id, raw_Iq;
+        JerryFOC_Park(Ialpha, Ibeta, electrical_angle, &raw_Id, &raw_Iq);
 
         // 5. 电流滤波 (由于在此执行频率严格等于 5kHz，因此 Ts 固定为 0.0002s)
         float Ts_curr = 0.0002f;
         float alpha = M0_Curr_Flt.Tf / (M0_Curr_Flt.Tf + Ts_curr);
         iq_current = alpha * M0_Curr_Flt.y_prev + (1.0f - alpha) * raw_Iq;
         M0_Curr_Flt.y_prev = iq_current;
+        // 对于 Id，我们暂时用极其简单的一阶低通或直接使用原值（为了省内存，可以直接用同样的 alpha 系数手算）
+        static float id_prev = 0.0f;
+        id_current = alpha * id_prev + (1.0f - alpha) * raw_Id;
+        id_prev = id_current;
 
+        // 7. 【控制模式抉择】根据标志位决定是否使用电流环
         float Uq = 0.0f;
-        if (current_control_mode == JERRYFOC_MODE_VELOCITY) {
-            // 速度模式下，速度环直接输出电压 Uq (忽略电流环，避免 ADC 噪声干扰)
+        float Ud = 0.0f;
+        
+        if (!flag_use_current_loop) {
+            // 【电压控制模式】(云台电机默认)
+            // 内阻大电感小，电流完全随电压瞬变。直接将外环的输出作为电压 Uq 馈入。
             Uq = JerryFOC_Target_Iq; 
+            Ud = 0.0f;
         } else {
-            // 扭矩模式，走电流环
-            float error = JerryFOC_Target_Iq - iq_current;
-            float proportional = curr_loop_M0.P * error;
-            float integral = curr_loop_M0.integral_prev + curr_loop_M0.I * Ts_curr * 0.5f * (error + curr_loop_M0.error_prev);
-            integral = _constrain(integral, -curr_loop_M0.limit, curr_loop_M0.limit);
-            curr_loop_M0.integral_prev = integral;
-            curr_loop_M0.error_prev = error;
-            Uq = proportional + integral;
-            Uq = _constrain(Uq, -curr_loop_M0.limit, curr_loop_M0.limit);
+            // 【电流闭环模式】(航模/大功率无刷电机必须开启)
+            // 计算 Iq 环 (目标值为外环的输出，即 JerryFOC_Target_Iq)
+            float err_q = JerryFOC_Target_Iq - iq_current;
+            float prop_q = iq_loop_M0.P * err_q;
+            float integ_q = iq_loop_M0.integral_prev + iq_loop_M0.I * Ts_curr * 0.5f * (err_q + iq_loop_M0.error_prev);
+            integ_q = _constrain(integ_q, -iq_loop_M0.limit, iq_loop_M0.limit);
+            iq_loop_M0.integral_prev = integ_q;
+            iq_loop_M0.error_prev = err_q;
+            Uq = _constrain(prop_q + integ_q, -iq_loop_M0.limit, iq_loop_M0.limit);
+
+            float err_d = 0.0f - id_current;
+            float prop_d = id_loop_M0.P * err_d;
+            float integ_d = id_loop_M0.integral_prev + id_loop_M0.I * Ts_curr * 0.5f * (err_d + id_loop_M0.error_prev);
+            integ_d = _constrain(integ_d, -id_loop_M0.limit, id_loop_M0.limit);
+            id_loop_M0.integral_prev = integ_d;
+            id_loop_M0.error_prev = err_d;
+            Ud = _constrain(prop_d + integ_d, -id_loop_M0.limit, id_loop_M0.limit);
         }
 
-        // 7. FOC 换相
-        JerryFOC_setPhaseVoltage(Uq, 0.0f, electrical_angle);
+        // 8. FOC 换相
+        JerryFOC_setPhaseVoltage(Uq, Ud, electrical_angle);
     }
 }
 
@@ -277,21 +330,51 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
         // 3. 速度低通滤波 (恢复为正向。之前反向是因为畸变的电流环导致的假象)
         filtered_velocity_global = JerryFOC_LPF_Calc(&M0_Vel_Flt, raw_velocity);
         
-        // 4. 计算速度误差
-        float error = JerryFOC_Target_Velocity - filtered_velocity_global;
-        
-        // 5. PID 计算得出目标 Iq 电流
-        if (current_control_mode == JERRYFOC_MODE_VELOCITY) {
-            JerryFOC_Target_Iq = JerryFOC_PID_Calc(&vel_loop_M0, error);
+        // 4. 根据模式计算并串联 PID
+        if (current_control_mode == JERRYFOC_MODE_POSITION) {
+            // [外环] 位置环：输入位置误差，输出目标速度
+            float error_pos = JerryFOC_Target_Position - current_mechanical_angle;
+            JerryFOC_Target_Velocity = JerryFOC_PID_Calc(&pos_loop_M0, error_pos);
+            
+            // [内环] 速度环：输入速度误差，输出目标电流(实际为 Uq)
+            float error_vel = JerryFOC_Target_Velocity - filtered_velocity_global;
+            JerryFOC_Target_Iq = JerryFOC_PID_Calc(&vel_loop_M0, error_vel);
+        } 
+        else if (current_control_mode == JERRYFOC_MODE_VELOCITY) {
+            // 仅使用速度环：输入速度误差，输出目标电流(实际为 Uq)
+            float error_vel = JerryFOC_Target_Velocity - filtered_velocity_global;
+            JerryFOC_Target_Iq = JerryFOC_PID_Calc(&vel_loop_M0, error_vel);
         }
 
-        // 6. 每 100ms 通过串口打印一次真实计算出的速度，让我们看看它到底读到了什么！
+        // 5. 每 10ms (100Hz) 通过串口发送一次 JustFloat 协议数据包给 VOFA+
         static int print_counter = 0;
-        if (++print_counter >= 100) {
+        if (++print_counter >= 10) {
             print_counter = 0;
-            char buf[80];
-            int len = snprintf(buf, sizeof(buf), "T:%.1f A:%.1f Uq:%.3f\r\n", JerryFOC_Target_Velocity, filtered_velocity_global, JerryFOC_Target_Iq);
-            HAL_UART_Transmit(&huart1, (uint8_t*)buf, len, 10);
+            
+            // JustFloat 数据结构 (扩展为7个通道)
+            // 【必须用 static】因为 HAL_UART_Transmit_IT 是非阻塞的，
+            // 如果 frame 在栈上，函数返回后内存被销毁，UART 就会发送垃圾数据！
+            static struct Frame {
+                float fdata[7];
+                unsigned char tail[4];
+            } frame;
+            
+            // 填充数据：CH0~CH6
+            frame.fdata[0] = JerryFOC_Target_Position;     // CH0: 目标位置
+            frame.fdata[1] = current_mechanical_angle;     // CH1: 实际位置
+            frame.fdata[2] = JerryFOC_Target_Velocity;     // CH2: 目标速度 (或位置环输出的速度)
+            frame.fdata[3] = filtered_velocity_global;     // CH3: 实际速度
+            frame.fdata[4] = iq_current;                   // CH4: 实际 Iq 电流
+            frame.fdata[5] = phase_current_a;              // CH5: A相原始电流
+            frame.fdata[6] = phase_current_b;              // CH6: B相原始电流
+            
+            // 填充固定帧尾
+            frame.tail[0] = 0x00;
+            frame.tail[1] = 0x00;
+            frame.tail[2] = 0x80;
+            frame.tail[3] = 0x7f;
+            
+            HAL_UART_Transmit_IT(&huart1, (uint8_t*)&frame, sizeof(frame));
         }
     }
 }

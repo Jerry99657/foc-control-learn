@@ -32,6 +32,7 @@
 #include "JerryFOC.h"
 #include "MT6701.h"
 #include <stdlib.h> // for atof
+#include <string.h> // for strncmp
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -71,8 +72,22 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     if(huart->Instance == USART1) {
         if(rx_byte == '\n') {
             rx_buffer[rx_index] = '\0';
-            float target = atof(rx_buffer);
-            JerryFOC_setVelocity(target); // 更新目标速度
+            
+            // 解析 VOFA+ 下发的指令
+            if (strncmp(rx_buffer, "Speed:", 6) == 0) {
+                float target = atof(rx_buffer + 6);
+                JerryFOC_setMode(JERRYFOC_MODE_VELOCITY);
+                JerryFOC_setVelocity(target);
+            } else if (strncmp(rx_buffer, "Angle:", 6) == 0) {
+                float target = atof(rx_buffer + 6);
+                JerryFOC_setMode(JERRYFOC_MODE_POSITION);
+                JerryFOC_setPosition(target, 0.0f); // 0 表示使用默认限幅
+            } else if (strncmp(rx_buffer, "Torque:", 7) == 0) {
+                float target = atof(rx_buffer + 7);
+                JerryFOC_setMode(JERRYFOC_MODE_TORQUE);
+                JerryFOC_setCurrent(target);
+            }
+            
             rx_index = 0;
         } else if (rx_byte != '\r') {
             if(rx_index < 31) {
@@ -140,9 +155,13 @@ int main(void)
   // 开启 USART1 串口中断接收，等待上位机下发速度指令
   HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
 
-  // 开启 ADC 的注入组！这非常关键，这是硬件级电流采样的核心！
-  HAL_ADCEx_InjectedStart(&hadc1);
+  // 在开启 ADC 前，必须先执行上电自校准！这是 STM32G4 读出正确数据（而不是0）的硬性要求！
+  HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
+  HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
+
+  // 开启 ADC 的注入组！对于双 ADC 同步模式，【必须先启动从机(ADC2)，再启动主机(ADC1)】！
   HAL_ADCEx_InjectedStart(&hadc2);
+  HAL_ADCEx_InjectedStart(&hadc1);
 
   // 这里暂时不要开启 TIM2！否则会导致 alignSensor 期间速度计算发生瞬间飞车突变！
 
