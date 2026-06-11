@@ -173,7 +173,7 @@ int main(void)
 
   // ===== 速度-电流双闭环模式 =====
   JerryFOC_setMode(JERRYFOC_MODE_VELOCITY);
-  JerryFOC_setVelocity(20.0f);  // 目标速度 20 rad/s (约 3.2 圈/秒)
+  // JerryFOC_setVelocity(20.0f);  // 目标速度 20 rad/s (约 3.2 圈/秒)
 
   // 开启 TIM2 定时器中断
   HAL_TIM_Base_Start_IT(&htim2);

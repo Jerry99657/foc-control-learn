@@ -85,8 +85,8 @@ LowPassFilter M0_Curr_Flt = { .Tf = 0.0001f, .y_prev = 0.0f };
 // 位置外环 PID (纯P控制即可，P=2.0 比较柔和，限幅默认为 30.0 rad/s)
 PIDController pos_loop_M0 = { .P = 2.0f, .I = 0.0f, .D = 0.0f, .output_ramp = 0.0f, .limit = 30.0f, .error_prev = 0.0f, .output_prev = 0.0f, .integral_prev = 0.0f };
 
-// 速度内环 PID (直接输出电压 Uq！限幅 2.0V 足够让云台电机达到最高速)
-PIDController vel_loop_M0 = { .P = 0.05f, .I = 0.5f, .D = 0.0f, .output_ramp = 0.0f, .limit = 2.0f, .error_prev = 0.0f, .output_prev = 0.0f, .integral_prev = 0.0f };
+// 速度内环 PID (直接输出电压 Uq！限幅设为 SVPWM 线性区最大相电压 Udc/sqrt(3) ≈ 6.93V)
+PIDController vel_loop_M0 = { .P = 0.05f, .I = 0.5f, .D = 0.0f, .output_ramp = 0.0f, .limit = 6.93f, .error_prev = 0.0f, .output_prev = 0.0f, .integral_prev = 0.0f };
 
 // 电流最内环 PID (带宽降低为 250rad/s，避免高频震荡)
 // P = Ls * 250 = 0.00086 * 250 = 0.215
@@ -163,12 +163,32 @@ static void setPwm(float Ua, float Ub, float Uc) {
 void JerryFOC_setPhaseVoltage(float Uq, float Ud, float angle_el) {
     angle_el = _normalizeAngle(angle_el);
     
+    // 1. 逆 Park 变换：将 d-q 轴电压转换为 alpha-beta 轴电压
     float Ualpha = -Uq * sin(angle_el) + Ud * cos(angle_el); 
     float Ubeta  =  Uq * cos(angle_el) + Ud * sin(angle_el); 
 
-    float Ua = Ualpha + voltage_power_supply/2;
-    float Ub = (sqrt(3)*Ubeta - Ualpha)/2 + voltage_power_supply/2;
-    float Uc = (-Ualpha - sqrt(3)*Ubeta)/2 + voltage_power_supply/2;
+    // ----- 原 SPWM 调制方法 (已注释) -----
+    // float Ua = Ualpha + voltage_power_supply/2;
+    // float Ub = (sqrt(3)*Ubeta - Ualpha)/2 + voltage_power_supply/2;
+    // float Uc = (-Ualpha - sqrt(3)*Ubeta)/2 + voltage_power_supply/2;
+    
+    // ----- 新 SVPWM 调制方法 (Min-Max 零序注入法) -----
+    // 1. 逆 Clarke 变换：得到以中性点为参考的纯三相电压
+    float Ua = Ualpha;
+    float Ub = -0.5f * Ualpha + (sqrtf(3.0f)/2.0f) * Ubeta;
+    float Uc = -0.5f * Ualpha - (sqrtf(3.0f)/2.0f) * Ubeta;
+    
+    // 2. 找出三相电压中的最大值和最小值
+    float Umax = Ua > Ub ? (Ua > Uc ? Ua : Uc) : (Ub > Uc ? Ub : Uc);
+    float Umin = Ua < Ub ? (Ua < Uc ? Ua : Uc) : (Ub < Uc ? Ub : Uc);
+    
+    // 3. 计算共模电压（零序分量）：使波形对称居中于 50% 占空比
+    float Ucom = (voltage_power_supply / 2.0f) - (Umax + Umin) / 2.0f;
+    
+    // 4. 将零序电压注入，生成马鞍波
+    Ua += Ucom;
+    Ub += Ucom;
+    Uc += Ucom;
     
     setPwm(Ua, Ub, Uc);
 }
