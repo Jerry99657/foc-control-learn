@@ -47,6 +47,12 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     mycode/open_loop.c
     mycode/MT6701.c
     mycode/JerryFOC.c
+    mycode/close_loop.c
+    mycode/motor_params.c
+    mycode/angle_src_encoder.c
+    mycode/angle_src_smo.c
+    mycode/smo.c
+    mycode/startup.c
     # Add user sources here
 )
 

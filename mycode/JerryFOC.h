@@ -4,7 +4,8 @@
 #include "main.h"
 #include "tim.h"
 #include <math.h>
-#include "MT6701.h"
+#include "angle_source.h"
+#include "motor_params.h"
 
 #ifndef PI
 #define PI 3.14159265358979323846f
@@ -49,6 +50,12 @@ typedef enum {
     JERRYFOC_MODE_POSITION = 2   // 位置模式 (位置外环 + 速度内环 + Iq 最内环)
 } JerryFOC_ControlMode;
 
+// ================= 电机选择枚举 =================
+typedef enum {
+    JERRYFOC_MOTOR_C2804 = 0,
+    JERRYFOC_MOTOR_C2208 = 1,
+} JerryFOC_MotorID;
+
 // ================= 接口函数声明 =================
 // 启动音效
 void JerryFOC_playStartupSound(void);
@@ -60,6 +67,7 @@ void JerryFOC_setVelocity(float target_vel);
 void JerryFOC_setCurrent(float target_Iq);
 void JerryFOC_alignSensor(void);
 void JerryFOC_setPhaseVoltage(float Uq, float Ud, float angle_el);
+void JerryFOC_BumplessTransition(void);
 
 // PID 与滤波计算函数
 float JerryFOC_LPF_Calc(LowPassFilter* filter, float x);
@@ -81,5 +89,11 @@ float JerryFOC_getIq(void);
 
 // 主循环高速调用接口
 void JerryFOC_run(void);
+
+// ================= 新增：双电机 + 角度源 =================
+void JerryFOC_selectMotor(JerryFOC_MotorID id);
+void JerryFOC_setAngleSource(AngleSource *src);
+const MotorParams* JerryFOC_getMotorParams(void);
+AngleSource* JerryFOC_getAngleSource(void);
 
 #endif

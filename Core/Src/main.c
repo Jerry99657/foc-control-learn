@@ -31,6 +31,9 @@
 /* USER CODE BEGIN Includes */
 #include "JerryFOC.h"
 #include "MT6701.h"
+#include "angle_src_encoder.h"
+#include "angle_src_smo.h"
+#include "startup.h"
 #include <stdlib.h> // for atof
 #include <string.h> // for strncmp
 /* USER CODE END Includes */
@@ -67,25 +70,144 @@ void SystemClock_Config(void);
 uint8_t rx_byte;
 char rx_buffer[32];
 uint8_t rx_index = 0;
+volatile uint8_t g_need_align = 0;
+volatile uint8_t g_is_sensorless = 1; // 默认使用 SMO 无感模式
+
+// 开环诊断模式全局变量（定义在 JerryFOC.c）
+extern volatile uint8_t g_openloop_debug;
+extern volatile float g_openloop_angle;
+extern volatile float JerryFOC_Target_Velocity;  // 当前目标速度
+
+// 无感启动配置
+static StartupConfig startup_cfg = {
+    .align_current = 0.40f,
+    .align_duration = 0.7f,
+    .align_angle = 0.0f,
+    .openloop_Iq = 0.40f,
+    .openloop_ramp = 10.0f,
+    .switch_speed = 15.0f,
+    .switch_duration = 0.6f,
+    .lock_duration = 0.05f,
+    .switch_timeout = 5.0f,
+    .lock_loss_timeout = 0.10f,
+    .lock_speed_tolerance = 6.0f,
+    .lock_phase_tolerance = 1.2f,
+};
+static AngleSource *g_smo_src = NULL;  // 保存 SMO 角度源，切换时复用
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     if(huart->Instance == USART1) {
         if(rx_byte == '\n') {
             rx_buffer[rx_index] = '\0';
             
-            // 解析 VOFA+ 下发的指令
             if (strncmp(rx_buffer, "Speed:", 6) == 0) {
                 float target = atof(rx_buffer + 6);
+                if (target < 5.0f) target = 5.0f;
+                uint32_t primask = __get_PRIMASK();
+                __disable_irq();
+                // 只有无感模式才需要启动状态机，有感模式直接闭环
+                StartupState startup_state = Startup_GetState();
+                if (g_is_sensorless &&
+                    (startup_state == STARTUP_IDLE || startup_state == STARTUP_FAULT)) {
+                    Startup_Init(7, &startup_cfg, 10000.0f);
+                    Startup_Begin();
+                }
                 JerryFOC_setMode(JERRYFOC_MODE_VELOCITY);
                 JerryFOC_setVelocity(target);
+                if (!primask) __enable_irq();
             } else if (strncmp(rx_buffer, "Angle:", 6) == 0) {
                 float target = atof(rx_buffer + 6);
+                uint32_t primask = __get_PRIMASK();
+                __disable_irq();
                 JerryFOC_setMode(JERRYFOC_MODE_POSITION);
-                JerryFOC_setPosition(target, 0.0f); // 0 表示使用默认限幅
+                JerryFOC_setPosition(target, 0.0f);
+                if (!primask) __enable_irq();
             } else if (strncmp(rx_buffer, "Torque:", 7) == 0) {
                 float target = atof(rx_buffer + 7);
+                uint32_t primask = __get_PRIMASK();
+                __disable_irq();
                 JerryFOC_setMode(JERRYFOC_MODE_TORQUE);
                 JerryFOC_setCurrent(target);
+                if (!primask) __enable_irq();
+            } else if (strncmp(rx_buffer, "Motor:", 6) == 0) {
+                int id = atoi(rx_buffer + 6);
+                uint32_t primask = __get_PRIMASK();
+                __disable_irq();
+                g_is_sensorless = 0; // 切换为有感
+                g_openloop_debug = 0;
+                JerryFOC_setMode(JERRYFOC_MODE_TORQUE);
+                JerryFOC_setVelocity(0.0f);
+                JerryFOC_setCurrent(0.0f);
+                Startup_Stop();
+                MT6701_StartContinuous();
+                JerryFOC_selectMotor((JerryFOC_MotorID)id);
+                JerryFOC_setAngleSource(AngleSrc_Encoder_Init(7));
+                if (id == JERRYFOC_MOTOR_C2804) {
+                    g_need_align = 1;
+                }
+                if (!primask) __enable_irq();
+            } else if (strcmp(rx_buffer, "Sensorless") == 0) {
+                // 只负责配置/待机；随后 Speed 命令启动 ALIGN->OPENLOOP 流程。
+                uint32_t primask = __get_PRIMASK();
+                __disable_irq();
+                MT6701_StopContinuous();
+                g_is_sensorless = 1;
+                g_openloop_debug = 0;
+                JerryFOC_selectMotor(JERRYFOC_MOTOR_C2208);
+                JerryFOC_useCurrentLoop(1);
+                JerryFOC_setMode(JERRYFOC_MODE_TORQUE);
+                JerryFOC_setVelocity(15.0f);
+                JerryFOC_setCurrent(0.0f);
+                g_openloop_angle = 0.0f;
+                g_smo_src = AngleSrc_SMO_Create(&MOTOR_C2208, 10000.0f);
+                JerryFOC_setAngleSource(g_smo_src);
+                Startup_Init(7, &startup_cfg, 10000.0f);
+                if (!primask) __enable_irq();
+            } else if (strcmp(rx_buffer, "Lock") == 0) {
+                // 手动命令只能请求安全切换，不能绕过反电势/速度/相位判据。
+                if (g_is_sensorless) {
+                    uint32_t primask = __get_PRIMASK();
+                    __disable_irq();
+                    g_openloop_debug = 0;
+                    JerryFOC_useCurrentLoop(1);
+                    if (g_smo_src) JerryFOC_setAngleSource(g_smo_src);
+                    StartupState startup_state = Startup_GetState();
+                    if (startup_state == STARTUP_IDLE || startup_state == STARTUP_FAULT) {
+                        Startup_Begin();
+                    }
+                    Startup_ForceClosed();
+                    JerryFOC_setMode(JERRYFOC_MODE_VELOCITY);
+                    if (!primask) __enable_irq();
+                }
+            } else if (strncmp(rx_buffer, "OpenLoop:", 9) == 0) {
+                // 纯开环诊断：固定电压 + 旋转角度
+                // 格式：OpenLoop:速度,电压  例如 OpenLoop:30,6
+                float speed = 10.0f, voltage = 4.0f;
+                char *comma = strchr(rx_buffer + 9, ',');
+                if (comma) {
+                    *comma = '\0';
+                    speed = atof(rx_buffer + 9);
+                    voltage = atof(comma + 1);
+                } else {
+                    speed = atof(rx_buffer + 9);
+                }
+                if (speed < 2.0f) speed = 10.0f;
+                if (voltage < 0.5f) voltage = 0.5f;
+                if (voltage > 11.0f) voltage = 11.0f;
+                uint32_t primask = __get_PRIMASK();
+                __disable_irq();
+                g_is_sensorless = 0;
+                Startup_Stop();
+                MT6701_StartContinuous();
+                JerryFOC_selectMotor(JERRYFOC_MOTOR_C2208);
+                JerryFOC_useCurrentLoop(0);
+                JerryFOC_setAngleSource(AngleSrc_Encoder_Init(7));
+                JerryFOC_setMode(JERRYFOC_MODE_TORQUE);
+                JerryFOC_setVelocity(speed);
+                JerryFOC_setCurrent(voltage);
+                g_openloop_debug = 1;
+                g_openloop_angle = 0.0f;
+                if (!primask) __enable_irq();
             }
             
             rx_index = 0;
@@ -149,33 +271,41 @@ int main(void)
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
-    // 2. 触发第一次 MT6701 的 SPI DMA 读取，建立后台循环更新
-  HAL_SPI_TransmitReceive_DMA(&hspi1, MT6701_Data, MT6701_Data, 3);
-  
-  // 开启 USART1 串口中断接收，等待上位机下发速度指令
-  HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
 
-  // 在开启 ADC 前，必须先执行上电自校准！这是 STM32G4 读出正确数据（而不是0）的硬性要求！
+  // 3. 默认无感模式不启动 MT6701 连续 DMA，避免高频 DMA 中断干扰 FOC。
+  MT6701_StopContinuous();
+
+  // 4. 开启 USART1 串口中断接收
+  HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
+  HAL_UART_Transmit(&huart1, (uint8_t*)"TEST\r\n", 6, 100);
+
+  // 5. ADC 上电自校准
   HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
   HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
 
-  // 开启 ADC 的注入组！对于双 ADC 同步模式，【必须先启动从机(ADC2)，再启动主机(ADC1)】！
-  HAL_ADCEx_InjectedStart(&hadc2);
-  HAL_ADCEx_InjectedStart(&hadc1);
+  // ===== 6. 初始化角度源：默认 SMO（无感模式） =====
+  AngleSrc_Encoder_Init(7);
+  g_smo_src = AngleSrc_SMO_Create(&MOTOR_C2208, 10000.0f);
+  JerryFOC_setAngleSource(g_smo_src);
 
-  // 这里暂时不要开启 TIM2！否则会导致 alignSensor 期间速度计算发生瞬间飞车突变！
+  // ===== 7. 默认电机：C2208 =====
+  JerryFOC_selectMotor(JERRYFOC_MOTOR_C2208);
+  JerryFOC_useCurrentLoop(1);  // C2208 必须启用电流环
 
-  // 播放大疆启动音效 (滴-滴-滴-滴)
-  JerryFOC_playStartupSound();
+  // ===== 8. 播放大疆启动音效 =====
+  // JerryFOC_playStartupSound();
 
-  // 3. 执行电机零点对齐标定 (注意电机在上电时会强制转动一下然后锁死3秒)
-  JerryFOC_alignSensor();
+  // ===== 9. 预初始化启动配置，但不自动开始 ====
+  // 等待串口发送 Speed:XX 或 Sensorless 才开始转
+  JerryFOC_setMode(JERRYFOC_MODE_TORQUE);
+  JerryFOC_setCurrent(0.0f);  // 上电不输出力矩
+  Startup_Init(7, &startup_cfg, 10000.0f);
 
-  // ===== 速度-电流双闭环模式 =====
-  JerryFOC_setMode(JERRYFOC_MODE_VELOCITY);
-  // JerryFOC_setVelocity(20.0f);  // 目标速度 20 rad/s (约 3.2 圈/秒)
+  // 10. 开启 ADC 注入组：从机先启动，主机转换完成中断驱动 10kHz FOC。
+  HAL_ADCEx_InjectedStart_IT(&hadc2);
+  HAL_ADCEx_InjectedStart_IT(&hadc1);
 
-  // 开启 TIM2 定时器中断
+  // 开启 TIM2 定时器中断（1ms 速度/位置外环）
   HAL_TIM_Base_Start_IT(&htim2);
 
   /* USER CODE END 2 */
@@ -187,8 +317,17 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    // 内环：极速 FOC 换相
-    JerryFOC_run();
+    if (g_need_align) {
+        g_need_align = 0;
+        // 先停掉所有控制，设为空载
+        JerryFOC_setMode(JERRYFOC_MODE_TORQUE);
+        JerryFOC_setCurrent(0.0f);
+        // 使用编码器角度源，并调用阻塞式对齐函数
+        JerryFOC_setAngleSource(AngleSrc_Encoder_Init(JerryFOC_getMotorParams()->pole_pairs));
+        JerryFOC_alignSensor();
+    }
+
+    // 10kHz FOC 已由 ADC 注入完成中断驱动；主循环只处理低优先级任务。
   }
   /* USER CODE END 3 */
 }

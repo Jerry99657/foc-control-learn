@@ -28,4 +28,8 @@ extern float Angle;
 extern float Encoder_Offset;
 extern uint8_t MT6701_Data[3];
 
+void MT6701_StartContinuous(void);
+void MT6701_StopContinuous(void);
+uint8_t MT6701_IsContinuous(void);
+
 #endif

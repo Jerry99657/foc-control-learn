@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>SVPWM 马鞍波零序注入法 仿真原理图</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #f4f4f9; }
+        .chart-container { width: 90%; max-width: 1200px; margin: 20px auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        h1, h2 { text-align: center; color: #333; }
+        p { text-align: center; color: #666; font-size: 14px; }
+    </style>
+</head>
+<body>
+
+    <h1>SVPWM 零序注入法 (Min-Max) 交互式仿真</h1>
+    <p>拖动鼠标可查看具体数值，点击图例可隐藏/显示相应曲线</p>
+
+    <div class="chart-container">
+        <h2>1. 纯正弦相电压 (SPWM 基础)</h2>
+        <canvas id="chartSine"></canvas>
+    </div>
+
+    <div class="chart-container">
+        <h2>2. 提取最值与计算零序电压 (Ucom)</h2>
+        <canvas id="chartUcom"></canvas>
+    </div>
+
+    <div class="chart-container">
+        <h2>3. 最终注入后的马鞍波 (SVPWM 相电压)</h2>
+        <canvas id="chartSaddle"></canvas>
+    </div>
+
+    <script>
+        // 生成 0 到 360 度的电角度数据
+        const angles = [];
+        const Ua = [], Ub = [], Uc = [];
+        const Umax = [], Umin = [], Ucom = [];
+        const Ua_saddle = [], Ub_saddle = [], Uc_saddle = [];
+        
+        const Udc = 12.0; // 母线电压
+        const amplitude = 6.928; // Udc / sqrt(3) 满幅线性调制
+
+        for (let i = 0; i <= 360; i++) {
+            const rad = i * Math.PI / 180;
+            angles.push(i);
+            
+            // 1. 逆 Clarke 产生的纯正弦波
+            const a = amplitude * Math.cos(rad);
+            const b = amplitude * Math.cos(rad - 2 * Math.PI / 3);
+            const c = amplitude * Math.cos(rad + 2 * Math.PI / 3);
+            Ua.push(a);
+            Ub.push(b);
+            Uc.push(c);
+            
+            // 2. 找到最大值和最小值
+            const max_val = Math.max(a, b, c);
+            const min_val = Math.min(a, b, c);
+            Umax.push(max_val);
+            Umin.push(min_val);
+            
+            // 3. 计算零序电压 Ucom (为了居中平移到 Udc/2 = 6V)
+            const com = (Udc / 2.0) - (max_val + min_val) / 2.0;
+            Ucom.push(com);
+            
+            // 4. 注入零序电压形成马鞍波
+            Ua_saddle.push(a + com);
+            Ub_saddle.push(b + com);
+            Uc_saddle.push(c + com);
+        }
+
+        const commonOptions = {
+            responsive: true,
+            interaction: { mode: 'index', intersect: false },
+            scales: { x: { title: { display: true, text: '电角度 (度)' } }, y: { title: { display: true, text: '电压 (V)' } } }
+        };
+
+        // 图1：纯正弦波
+        new Chart(document.getElementById('chartSine'), {
+            type: 'line',
+            data: {
+                labels: angles,
+                datasets: [
+                    { label: 'Ua (正弦)', data: Ua, borderColor: 'red', borderWidth: 2, pointRadius: 0 },
+                    { label: 'Ub (正弦)', data: Ub, borderColor: 'green', borderWidth: 2, pointRadius: 0 },
+                    { label: 'Uc (正弦)', data: Uc, borderColor: 'blue', borderWidth: 2, pointRadius: 0 }
+                ]
+            },
+            options: commonOptions
+        });
+
+        // 图2：最值与 Ucom
+        new Chart(document.getElementById('chartUcom'), {
+            type: 'line',
+            data: {
+                labels: angles,
+                datasets: [
+                    { label: 'Umax (三相包络线上沿)', data: Umax, borderColor: 'rgba(255, 165, 0, 0.5)', borderWidth: 2, borderDash: [5, 5], pointRadius: 0 },
+                    { label: 'Umin (三相包络线下沿)', data: Umin, borderColor: 'rgba(128, 0, 128, 0.5)', borderWidth: 2, borderDash: [5, 5], pointRadius: 0 },
+                    { label: 'Ucom (零序注入电压)', data: Ucom, borderColor: 'black', borderWidth: 3, pointRadius: 0 }
+                ]
+            },
+            options: commonOptions
+        });
+
+        // 图3：马鞍波
+        new Chart(document.getElementById('chartSaddle'), {
+            type: 'line',
+            data: {
+                labels: angles,
+                datasets: [
+                    { label: 'Ua (马鞍波)', data: Ua_saddle, borderColor: 'red', borderWidth: 2, pointRadius: 0 },
+                    { label: 'Ub (马鞍波)', data: Ub_saddle, borderColor: 'green', borderWidth: 2, pointRadius: 0 },
+                    { label: 'Uc (马鞍波)', data: Uc_saddle, borderColor: 'blue', borderWidth: 2, pointRadius: 0 },
+                    { label: 'GND 边界', data: Array(361).fill(0), borderColor: 'gray', borderWidth: 1, borderDash: [2, 2], pointRadius: 0 },
+                    { label: 'Udc 边界', data: Array(361).fill(12), borderColor: 'gray', borderWidth: 1, borderDash: [2, 2], pointRadius: 0 }
+                ]
+            },
+            options: commonOptions
+        });
+    </script>
+</body>
+</html>
