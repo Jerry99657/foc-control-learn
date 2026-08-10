@@ -20,16 +20,25 @@
 
 float Diff_Indentify(float Diff);
 
-extern float Motor_Angle;
+extern volatile float Motor_Angle;
 extern volatile int Angle_Raw;
-extern float Encoder_Angle;
-extern float Elec_Angle;
-extern float Angle;
+extern volatile float Encoder_Angle;
+extern volatile float Elec_Angle;
+extern volatile float Angle;
 extern float Encoder_Offset;
 extern uint8_t MT6701_Data[3];
 
+// StartContinuous 仅使能定频采样；实际DMA请求由10kHz ADC回调中的
+// MT6701_Service() 发起，不再在DMA完成回调里无限自触发。
 void MT6701_StartContinuous(void);
 void MT6701_StopContinuous(void);
+void MT6701_Service(void);
 uint8_t MT6701_IsContinuous(void);
+uint8_t MT6701_IsHealthy(void);
+uint16_t MT6701_GetRawAngle(void);
+uint8_t MT6701_GetStatus(void);
+uint32_t MT6701_GetSampleCounter(void);
+uint32_t MT6701_GetErrorCounter(void);
+uint16_t MT6701_GetSampleAgeCycles(void);
 
 #endif

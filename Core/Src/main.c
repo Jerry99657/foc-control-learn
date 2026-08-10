@@ -71,7 +71,7 @@ uint8_t rx_byte;
 char rx_buffer[32];
 uint8_t rx_index = 0;
 volatile uint8_t g_need_align = 0;
-volatile uint8_t g_is_sensorless = 1; // 默认使用 SMO 无感模式
+volatile uint8_t g_is_sensorless = 0; // 上电默认使用C2804编码器有感模式
 
 // 开环诊断模式全局变量（定义在 JerryFOC.c）
 extern volatile uint8_t g_openloop_debug;
@@ -102,18 +102,30 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
             
             if (strncmp(rx_buffer, "Speed:", 6) == 0) {
                 float target = atof(rx_buffer + 6);
-                if (target < 5.0f) target = 5.0f;
+                // 有感速度环和编码器反馈均支持有符号速度，负目标必须
+                // 原样传入；只有尚未扩展反向启动的无感模式按停止处理。
+                if (g_is_sensorless && target < 0.0f) target = 0.0f;
                 uint32_t primask = __get_PRIMASK();
                 __disable_irq();
-                // 只有无感模式才需要启动状态机，有感模式直接闭环
-                StartupState startup_state = Startup_GetState();
-                if (g_is_sensorless &&
-                    (startup_state == STARTUP_IDLE || startup_state == STARTUP_FAULT)) {
-                    Startup_Init(7, &startup_cfg, 10000.0f);
-                    Startup_Begin();
+
+                if (target == 0.0f && g_is_sensorless) {
+                    // 纯无感在零速时没有可观测的反电动势。Speed:0 应直接
+                    // 退出启动/闭环并撤掉转矩，不能重新触发启动状态机。
+                    JerryFOC_setVelocity(0.0f);
+                    JerryFOC_setCurrent(0.0f);
+                    JerryFOC_setMode(JERRYFOC_MODE_TORQUE);
+                    Startup_Stop();
+                } else {
+                    // 只有非零无感速度命令才启动状态机；有感模式直接闭环。
+                    StartupState startup_state = Startup_GetState();
+                    if (g_is_sensorless &&
+                        (startup_state == STARTUP_IDLE || startup_state == STARTUP_FAULT)) {
+                        Startup_Init(7, &startup_cfg, 10000.0f);
+                        Startup_Begin();
+                    }
+                    JerryFOC_setMode(JERRYFOC_MODE_VELOCITY);
+                    JerryFOC_setVelocity(target);
                 }
-                JerryFOC_setMode(JERRYFOC_MODE_VELOCITY);
-                JerryFOC_setVelocity(target);
                 if (!primask) __enable_irq();
             } else if (strncmp(rx_buffer, "Angle:", 6) == 0) {
                 float target = atof(rx_buffer + 6);
@@ -272,8 +284,8 @@ int main(void)
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
 
-  // 3. 默认无感模式不启动 MT6701 连续 DMA，避免高频 DMA 中断干扰 FOC。
-  MT6701_StopContinuous();
+  // 3. 上电默认进入C2804有感模式，开启由ADC节拍调度的MT6701采样。
+  MT6701_StartContinuous();
 
   // 4. 开启 USART1 串口中断接收
   HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
@@ -283,23 +295,23 @@ int main(void)
   HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
   HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
 
-  // ===== 6. 初始化角度源：默认 SMO（无感模式） =====
-  AngleSrc_Encoder_Init(7);
+  // ===== 6. 初始化角度源：默认使用C2804的MT6701编码器 =====
+  AngleSource *encoder_src = AngleSrc_Encoder_Init(MOTOR_C2804.pole_pairs);
   g_smo_src = AngleSrc_SMO_Create(&MOTOR_C2208, 10000.0f);
-  JerryFOC_setAngleSource(g_smo_src);
+  JerryFOC_setAngleSource(encoder_src);
 
-  // ===== 7. 默认电机：C2208 =====
-  JerryFOC_selectMotor(JERRYFOC_MOTOR_C2208);
-  JerryFOC_useCurrentLoop(1);  // C2208 必须启用电流环
+  // ===== 7. 默认电机：C2804有感电压模式 =====
+  JerryFOC_selectMotor(JERRYFOC_MOTOR_C2804);
+  JerryFOC_useCurrentLoop(0);
 
   // ===== 8. 播放大疆启动音效 =====
-  // JerryFOC_playStartupSound();
+  JerryFOC_playStartupSound();
 
-  // ===== 9. 预初始化启动配置，但不自动开始 ====
-  // 等待串口发送 Speed:XX 或 Sensorless 才开始转
+  // ===== 9. 零转矩待机并请求C2804编码器零点标定 =====
   JerryFOC_setMode(JERRYFOC_MODE_TORQUE);
   JerryFOC_setCurrent(0.0f);  // 上电不输出力矩
   Startup_Init(7, &startup_cfg, 10000.0f);
+  g_need_align = 1U;
 
   // 10. 开启 ADC 注入组：从机先启动，主机转换完成中断驱动 10kHz FOC。
   HAL_ADCEx_InjectedStart_IT(&hadc2);

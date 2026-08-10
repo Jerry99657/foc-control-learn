@@ -5,6 +5,7 @@
 #include "usart.h"
 #include "angle_src_encoder.h"   // 编码器角度源 + Align
 #include "angle_src_smo.h"       // SMO 角度源
+#include "MT6701.h"              // 有感采样调度与健康状态
 #include "smo.h"                 // SMO_Update 接口
 #include "startup.h"             // 无感启动状态机
 #include "arm_math.h"            // 引入 ARM CMSIS-DSP 库
@@ -60,7 +61,7 @@ void JerryFOC_playStartupSound(void) {
 }
 
 // ================= 参数与全局变量 =================
-static const MotorParams *active_motor = &MOTOR_C2208;  // 默认 C2208
+static const MotorParams *active_motor = &MOTOR_C2804;  // 上电默认 C2804
 static AngleSource *angle_source = NULL;                 // 角度源（编码器或 SMO）
 
 // 纯开环诊断模式
@@ -71,6 +72,11 @@ static float g_shared_prev_Ud = 0.0f;
 static float g_shared_prev_Ualpha = 0.0f;
 static float g_shared_prev_Ubeta = 0.0f;
 static volatile uint8_t foc_fast_loop_enabled = 1U;
+
+// C2804有感速度指令规划：反转时先减速到零，再沿相反方向加速。
+#define SENSORED_ACCEL_LIMIT 100.0f   // rad/s^2
+#define SENSORED_DECEL_LIMIT 150.0f   // rad/s^2
+static float sensored_velocity_reference = 0.0f;
 
 // ================= 电流环相关硬件常数 =================
 #define SHUNT_RESISTOR 0.01f
@@ -134,6 +140,7 @@ void JerryFOC_selectMotor(JerryFOC_MotorID id) {
     vel_loop_M0.integral_prev = vel_loop_M0.error_prev = vel_loop_M0.output_prev = 0;
     pos_loop_M0.integral_prev = pos_loop_M0.error_prev = pos_loop_M0.output_prev = 0;
     M0_Vel_Flt.y_prev = 0;
+    sensored_velocity_reference = 0.0f;
 }
 
 const MotorParams* JerryFOC_getMotorParams(void) {
@@ -382,8 +389,12 @@ void JerryFOC_alignSensor(void) {
     JerryFOC_setPhaseVoltage(0.0f, 3.0f, 0.0f);
     HAL_Delay(3000);
 
-    // 记录零点偏移：当前位置即为电角度 0
-    AngleSrc_Encoder_Align(0.0f);
+    // 只有拿到新鲜编码器数据才允许记录零点。若SPI接线/磁铁异常，
+    // 保持未标定状态，后续快速环会持续撤掉PWM，而不会带着错误零点启动。
+    if (AngleSrc_Encoder_IsSource(angle_source) &&
+        MT6701_IsContinuous() && MT6701_IsHealthy()) {
+        AngleSrc_Encoder_Align(0.0f);
+    }
 
     JerryFOC_setPhaseVoltage(0.0f, 0.0f, 0.0f);
     foc_fast_loop_enabled = 1U;
@@ -396,9 +407,89 @@ float JerryFOC_getAngle(void) {
     return 0.0f;
 }
 
+static uint8_t sensored_c2804_active(void) {
+    return (active_motor == &MOTOR_C2804 &&
+            AngleSrc_Encoder_IsSource(angle_source)) ? 1U : 0U;
+}
+
+static uint8_t sensored_control_ready(void) {
+    if (!sensored_c2804_active()) {
+        return 1U;
+    }
+    return (MT6701_IsContinuous() && MT6701_IsHealthy() &&
+            AngleSrc_Encoder_IsAligned()) ? 1U : 0U;
+}
+
+static void reset_pid_state(PIDController *pid) {
+    pid->integral_prev = 0.0f;
+    pid->error_prev = 0.0f;
+    pid->output_prev = 0.0f;
+}
+
+static void seed_sensored_velocity_pi(void) {
+    sensored_velocity_reference = filtered_velocity_global;
+    float error = sensored_velocity_reference - filtered_velocity_global;
+    vel_loop_M0.integral_prev = _constrain(
+        JerryFOC_Target_Iq - vel_loop_M0.P * error,
+        -vel_loop_M0.limit, vel_loop_M0.limit);
+    vel_loop_M0.error_prev = error;
+    vel_loop_M0.output_prev = JerryFOC_Target_Iq;
+}
+
+static float update_velocity_reference(float command) {
+    if (!sensored_c2804_active()) {
+        sensored_velocity_reference = command;
+        return command;
+    }
+
+    // 正反转不能一步跨过零速。方向相反时先以减速度收敛到0，
+    // 下一控制周期再按加速度进入目标方向。
+    float desired = command;
+    float rate = SENSORED_ACCEL_LIMIT;
+    if (sensored_velocity_reference * command < 0.0f &&
+        fabsf(sensored_velocity_reference) > 1.0e-4f) {
+        desired = 0.0f;
+        rate = SENSORED_DECEL_LIMIT;
+    } else if (fabsf(command) < fabsf(sensored_velocity_reference)) {
+        rate = SENSORED_DECEL_LIMIT;
+    }
+
+    const float max_step = rate * 0.001f;
+    float delta = desired - sensored_velocity_reference;
+    if (delta > max_step) {
+        delta = max_step;
+    } else if (delta < -max_step) {
+        delta = -max_step;
+    }
+    sensored_velocity_reference += delta;
+
+    if (fabsf(desired - sensored_velocity_reference) < 1.0e-4f) {
+        sensored_velocity_reference = desired;
+    }
+    return sensored_velocity_reference;
+}
+
 
 // ================= 闭环：模式、速度、扭矩设定与获取 =================
-void JerryFOC_setMode(JerryFOC_ControlMode mode) { current_control_mode = mode; }
+void JerryFOC_setMode(JerryFOC_ControlMode mode) {
+    if (mode == current_control_mode) {
+        return;
+    }
+
+    // C2804有感模式切换时用当前速度和当前输出初始化速度环，防止
+    // Torque/Velocity/Position之间切换时旧积分项产生电压阶跃。
+    if (sensored_c2804_active()) {
+        if (mode == JERRYFOC_MODE_VELOCITY ||
+            mode == JERRYFOC_MODE_POSITION) {
+            seed_sensored_velocity_pi();
+        } else {
+            sensored_velocity_reference = filtered_velocity_global;
+            reset_pid_state(&vel_loop_M0);
+        }
+        reset_pid_state(&pos_loop_M0);
+    }
+    current_control_mode = mode;
+}
 void JerryFOC_setPosition(float target_pos, float limit) { 
     // 获取当前的绝对机械角度
     float current_abs_pos = JerryFOC_getAngle();
@@ -573,6 +664,16 @@ __RAM_FUNC void JerryFOC_run(void) {
         return;
     }
 
+    // C2804有感模式必须同时满足“编码器在线且已经完成零点标定”。
+    // 该保护位于10kHz快速环，编码器数据超时后不等待1kHz外环即可撤压。
+    if (!sensored_control_ready()) {
+        JerryFOC_Target_Iq = 0.0f;
+        JerryFOC_setPhaseVoltage(0.0f, 0.0f, 0.0f);
+        foc_loop_cycles = DWT->CYCCNT - start_cycles;
+        foc_loop_time_ns = (float)foc_loop_cycles * (1000.0f / 170.0f);
+        return;
+    }
+
     float current_leg1 = ((float)ADC1->JDR1 - adc_offset_count_a) *
                          ADC_TO_VOLTS * VOLTS_TO_AMPS;
     float current_leg2 = ((float)ADC2->JDR1 - adc_offset_count_b) *
@@ -723,8 +824,13 @@ __RAM_FUNC void JerryFOC_run(void) {
 }
 
 void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc) {
-    if (hadc->Instance == ADC1 && foc_fast_loop_enabled) {
-        JerryFOC_run();
+    if (hadc->Instance == ADC1) {
+        // SPI DMA不再在完成中断中自触发；由ADC节拍固定为10kHz，
+        // 标定暂停FOC期间也继续刷新编码器样本。
+        MT6701_Service();
+        if (foc_fast_loop_enabled) {
+            JerryFOC_run();
+        }
     }
 }
 
@@ -732,6 +838,14 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc) {
 // 所有的速度计算、低通滤波、PID 运算均在此处以 1ms 的严格时序定频执行！
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     if (htim->Instance == TIM2) {
+        const uint8_t encoder_mode = sensored_c2804_active();
+        if (encoder_mode) {
+            // 多圈位置与速度只有这一处更新，getter只读取缓存，避免一次
+            // 外环周期内多次读取角度导致跨圈状态被重复修改。
+            AngleSrc_Encoder_Update(0.001f);
+        }
+        const uint8_t control_ready = sensored_control_ready();
+
         // 1. 速度计算：优先使用角度源直接输出的速度（SMO PLL 输出）
         float raw_velocity = 0.0f;
         if (angle_source) {
@@ -759,14 +873,23 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
             current_mechanical_angle = angle_source->getMechanicalAngle();
         }
 
-        // 4. 根据模式计算并串联 PID
-        if (current_control_mode == JERRYFOC_MODE_POSITION) {
+        // 4. 根据模式计算并串联 PID。编码器异常时清空外环状态，
+        // 防止恢复通信后把超时期间积累的误差一次性施加到电机。
+        if (encoder_mode && !control_ready) {
+            JerryFOC_Target_Iq = 0.0f;
+            sensored_velocity_reference = filtered_velocity_global;
+            reset_pid_state(&vel_loop_M0);
+            reset_pid_state(&pos_loop_M0);
+        }
+        else if (current_control_mode == JERRYFOC_MODE_POSITION) {
             // [外环] 位置环：输入位置误差，输出目标速度
             float error_pos = JerryFOC_Target_Position - current_mechanical_angle;
             JerryFOC_Target_Velocity = JerryFOC_PID_Calc(&pos_loop_M0, error_pos);
 
             // [内环] 速度环：输入速度误差，输出目标电流(实际为 Uq)
-            float error_vel = JerryFOC_Target_Velocity - filtered_velocity_global;
+            float velocity_reference =
+                update_velocity_reference(JerryFOC_Target_Velocity);
+            float error_vel = velocity_reference - filtered_velocity_global;
 
             if (Startup_GetState() == STARTUP_IDLE || Startup_GetState() == STARTUP_CLOSED) {
                 JerryFOC_Target_Iq = JerryFOC_PID_Calc(&vel_loop_M0, error_vel);
@@ -775,8 +898,9 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
         else if (current_control_mode == JERRYFOC_MODE_VELOCITY) {
             // 仅使用速度环：输入速度误差，输出目标电流(实际为 Uq)
             StartupState startup_state = Startup_GetState();
-            float error_vel =
-                JerryFOC_Target_Velocity - filtered_velocity_global;
+            float velocity_reference =
+                update_velocity_reference(JerryFOC_Target_Velocity);
+            float error_vel = velocity_reference - filtered_velocity_global;
 
             // OPENLOOP/SWITCH 的 Iq 均由10kHz启动轨迹产生，速度 PI 只在
             // 有感 IDLE 或无感 CLOSED 状态运行。
@@ -863,6 +987,20 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
             frame.fdata[15] = smo_diag ? smo_diag->pll_error : 0.0f;
             // CH12/13: SMO反电动势α/β；CH14: |E|/(ψf·|ωe|)；
             // CH15: 原始归一化PLL误差（所有启动状态均可观察）
+
+            if (encoder_mode) {
+                // C2804有感模式下SMO诊断量没有意义，改为编码器与给定
+                // 规划器状态，方便直接判断SPI失联、标定遗漏和速度突变。
+                frame.fdata[7] = sensored_velocity_reference;              // CH7: 斜坡后速度给定
+                frame.fdata[8] = (float)MT6701_IsHealthy();                // CH8: 编码器健康状态
+                frame.fdata[9] = (float)MT6701_GetSampleAgeCycles();       // CH9: 样本年龄(100us/计数)
+                frame.fdata[10] = (float)MT6701_GetRawAngle();             // CH10: 14位原始角度
+                frame.fdata[11] = (float)MT6701_GetErrorCounter();         // CH11: SPI/DMA累计错误
+                frame.fdata[12] = angle_source->getElectricalAngle();      // CH12: 电角度(rad)
+                frame.fdata[13] = current_mechanical_angle;                // CH13: 多圈机械角(rad)
+                frame.fdata[14] = (float)MT6701_GetStatus();               // CH14: MT6701 Mg[3:0]
+                frame.fdata[15] = (float)AngleSrc_Encoder_IsAligned();      // CH15: 零点标定完成
+            }
             
             // 填充固定帧尾
             frame.tail[0] = 0x00;
